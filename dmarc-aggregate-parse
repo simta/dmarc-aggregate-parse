@@ -1,0 +1,345 @@
+#!/usr/bin/perl
+
+# This file is distributed under the terms of the MIT license. See COPYING.
+
+use strict;
+use warnings;
+use 5.014;
+
+use Getopt::Long qw(:config no_auto_abbrev no_ignore_case bundling);
+use File::Temp qw(tempdir);
+use IO::Uncompress::Gunzip qw(gunzip $GunzipError);
+use IO::Uncompress::Unzip qw(unzip $UnzipError);
+use MIME::Parser;
+use MIME::Words qw(:all);
+use Path::Tiny;
+use Perl6::Form qw(break_at);
+use Time::Piece;
+use XML::LibXML;
+
+use Data::Dumper;
+
+my @domains = ();
+my $list_domains = 0;
+my $origin_limit = -1;
+my $raw = 0;
+my $verbose = 0;
+
+GetOptions  (
+    'd|domain=s'        => \@domains,
+    'l|list-domains'    => \$list_domains,
+    'o|origins:i'       => \$origin_limit,
+    'r|raw'             => \$raw,
+    'v|verbose'         => \$verbose,
+);
+
+my $results = {};
+my $tmp = tempdir('parsedmarc.XXXXXXXX', TMPDIR => 1, CLEANUP => 1);
+
+foreach my $fname (@ARGV) {
+    my $buffer;
+
+    say "Parsing $fname" if $verbose;
+
+    if ($raw) {
+        $buffer = path($fname)->slurp;
+    }
+    else {
+        my $report;
+        my $gzip = 0;
+
+	my $parser = new MIME::Parser;
+	$parser->output_dir($tmp);
+
+	my $entity = $parser->parse_open($fname);
+	my $body = $entity->bodyhandle;
+	my $mime = lc($entity->mime_type);
+
+	if ($mime =~ m#^multipart/#) {
+	    say "Searching $mime" if $verbose;
+	    for my $partnum (0 .. ($entity->parts - 1)) {
+		my $part = $entity->parts($partnum);
+                $mime = lc($part->mime_type);
+		if ($mime eq 'application/gzip' ||
+                   $mime eq 'application/zip' ||
+		   $mime eq 'application/x-zip-compressed'
+                ) {
+		    $report = $part->bodyhandle;
+		    last;
+		}
+	    }
+        }
+        else {
+            $report = $body;
+        }
+
+        if (
+            $mime ne 'application/gzip' &&
+            $mime ne 'application/zip' &&
+            $mime ne 'application/x-zip-compressed'
+        ) {
+	    say STDERR "Unknown MIME type: $mime";
+	    next;
+        }
+
+        if (defined($report->path)) {
+            say 'Report is in ' . $report->path if $verbose;
+        }
+        else {
+            say STDERR "No report attachment found in $fname.";
+            next;
+        }
+
+	if ($mime eq 'application/gzip') {
+            if (! gunzip($report->path => \$buffer)) {
+                say STDERR "Gunzip failed for $fname: $GunzipError";
+                next;
+            }
+	}
+        else {
+            if (! unzip($report->path => \$buffer)) {
+                say STDERR "Unzip failed for $fname: $UnzipError";
+                next;
+            }
+	}
+    }
+   
+    my $xml = XML::LibXML->load_xml( string => $buffer, recover => 2 );
+
+    my ($meta) = $xml->findnodes('/feedback/report_metadata');
+    my $begin = $meta->findvalue('./date_range/begin');
+    my $end = $meta->findvalue('./date_range/end');
+    my $org = $meta->findvalue('./org_name');
+    my $report_id = $meta->findvalue('./report_id');
+    my $domain = $xml->findvalue('/feedback/policy_published/domain');
+    say "Report $org ($report_id) $begin to $end for $domain" if $verbose;
+
+    foreach my $r ($xml->findnodes('/feedback/record')) {
+        my $ip = $r->findvalue('./row/source_ip');
+        my $count = $r->findvalue('./row/count');
+        my $disposition = $r->findvalue('./row/policy_evaluated/disposition');
+        my $reason = $r->findvalue('./row/policy_evaluated/reason');
+        my $dkim_final = $r->findvalue('./row/policy_evaluated/dkim');
+        my $spf_final = $r->findvalue('./row/policy_evaluated/spf');
+        my $dmarc_domain = $r->findvalue('./identifiers/header_from');
+
+        # Check for malformed records
+
+        #   <!-- The policy actions specified by p and sp in the
+        #       DMARC record. -->
+        #   <xs:simpleType name="DispositionType">
+        #       <xs:restriction base="xs:string">
+        #           <xs:enumeration value="none"/>
+        #           <xs:enumeration value="quarantine"/>
+        #           <xs:enumeration value="reject"/>
+        #       </xs:restriction>
+        #   </xs:simpleType>
+        unless ($disposition =~ m/^(?:none|quarantine|reject)$/) {
+            say STDERR "Malformed disposition: $disposition";
+            last unless $verbose;
+        }
+
+        #   <!-- The DMARC-aligned authentication result. -->
+        #   <xs:simpleType name="DMARCResultType">
+        #       <xs:restriction base="xs:string">
+        #           <xs:enumeration value="pass"/>
+        #           <xs:enumeration value="fail"/>
+        #       </xs:restriction>
+        #   </xs:simpleType>
+        #
+        # 'none' is nonstandard but common
+        unless ($dkim_final =~ m/^(?:pass|fail|none)$/) {
+            say STDERR "Malformed DMARC result: $dkim_final";
+            last unless $verbose;
+        }
+
+        unless ($spf_final =~ m/^(?:pass|fail|none)$/) {
+            say STDERR "Malformed DMARC result: $spf_final";
+            last unless $verbose;
+        }
+
+        foreach my $bucket ( '_all', $dmarc_domain ) {
+            if ( ! defined $results->{$bucket}->{'begin'} || 
+                    $results->{$bucket}->{'begin'} > $begin ) {
+                $results->{$bucket}->{'begin'} = $begin;
+            }
+            if ( ! defined $results->{$bucket}->{'end'} ||
+                    $results->{$bucket}->{'end'} < $end ) {
+                $results->{$bucket}->{'end'} = $end;
+            }
+
+            $results->{$bucket}->{'count'} += $count;
+            $results->{$bucket}->{'org'}->{$org} += $count;
+            $results->{$bucket}->{'disposition'}->{$disposition} += $count;
+            $results->{$bucket}->{'dkim'}->{$dkim_final} += $count;
+            $results->{$bucket}->{'spf'}->{$spf_final} += $count;
+
+            $results->{$bucket}->{'sources'}->{$ip}->{'count'} += $count;
+            $results->{$bucket}->{'sources'}->{$ip}->{'dkim'}->{$dkim_final} += $count;
+            $results->{$bucket}->{'sources'}->{$ip}->{'spf'}->{$spf_final} += $count;
+
+            foreach my $dkimr ($r->findnodes('./auth_results/dkim')) {
+                my $dkim_result = $dkimr->findvalue('./result');
+                my $dkim_domain = $dkimr->findvalue('./domain');
+                if ($dkim_result eq 'pass') {
+                    if ($dkim_final eq 'pass' and substr($dkim_domain, -length($dmarc_domain)) eq $dmarc_domain or substr($dmarc_domain, -length($dkim_domain)) eq $dkim_domain) {
+                        $results->{$bucket}->{'aligned_dkim_good_domain'}->{$dkim_domain} += $count;
+                    }
+                    $results->{$bucket}->{'dkim_good_domain'}->{$dkim_domain} += $count;
+                }
+                else {
+                    #   <!-- DKIM verification result, according to RFC 5451
+                    #       Section 2.4.1. -->
+                    #   <xs:simpleType name="DKIMResultType">
+                    #       <xs:restriction base="xs:string">
+                    #           <xs:enumeration value="none"/>
+                    #           <xs:enumeration value="pass"/>
+                    #           <xs:enumeration value="fail"/>
+                    #           <xs:enumeration value="policy"/>
+                    #           <xs:enumeration value="neutral"/>
+                    #           <xs:enumeration value="temperror"/>
+                    #           <xs:enumeration value="permerror"/>
+                    #       </xs:restriction>
+                    #   </xs:simpleType>
+                    $results->{$bucket}->{'dkim_bad_domain'}->{$dkim_domain} += $count;
+                }
+            }
+
+            foreach my $spfr ($r->findnodes('./auth_results/spf')) {
+                my $spf_result = $spfr->findvalue('./result');
+                my $spf_domain = $spfr->findvalue('./domain');
+                if ($spf_result eq 'pass') {
+                    if ($spf_final eq 'pass') {
+                        $results->{$bucket}->{'aligned_spf_good_domain'}->{$spf_domain} += $count;
+                    }
+                    $results->{$bucket}->{'spf_good_domain'}->{$spf_domain} += $count;
+                }
+                else {
+                    #   <!-- SPF result -->
+                    #   <xs:simpleType name="SPFResultType">
+                    #       <xs:restriction base="xs:string">
+                    #           <xs:enumeration value="none"/>
+                    #           <xs:enumeration value="neutral"/>
+                    #           <xs:enumeration value="pass"/>
+                    #           <xs:enumeration value="fail"/>
+                    #           <xs:enumeration value="softfail"/>
+                    #       <!-- "TempError" commonly implemented as "unknown" -->
+                    #           <xs:enumeration value="temperror"/>
+                    #       <!-- "PermError" commonly implemented as "error" -->
+                    #           <xs:enumeration value="permerror"/>
+                    #       </xs:restriction>
+                    #   </xs:simpleType>
+                    $results->{$bucket}->{'spf_bad_domain'}->{$spf_domain} += $count;
+                }
+            }
+        }
+
+        #say "$count source:$ip domain:$dmarc_domain disposition:$disposition (spf:$spf_final dkim:$dkim_final) dkim:$dkim_domain:$dkim_result spf:$spf_domain:$spf_result" if $verbose;
+    }
+}
+
+my $fmt = '{>{*}>}{>{*}>}';
+
+if ($list_domains) {
+    print form {hfill => '-'}, '{>{*}<}', '-';
+    print form {hfill => ' '}, '|{>{*}<}|', "Domain Summary";
+    print form {hfill => '-'}, '{>{*}<}', '-';
+    say '';
+    print form $fmt, 'Earliest timestamp:', localtime($results->{'_all'}->{'begin'})->strftime('%F %T');
+    print form $fmt, 'Latest timestamp:', localtime($results->{'_all'}->{'end'})->strftime('%F %T');
+    say '';
+    foreach (sort { $results->{$b}->{'count'} <=> $results->{$a}->{'count'} } keys $results) {
+        print form $fmt, "$_:", $results->{$_}->{'count'};
+    }
+    say '';
+}
+
+if (@domains && $domains[0] eq 'all') {
+    @domains = sort { $results->{$b}->{'count'} <=> $results->{$a}->{'count'} } keys $results;
+}
+
+foreach my $domain (@domains) {
+    print form {hfill => '-'}, '{>{*}<}', '-';
+    print form {hfill => '*'}, '|{>{*}<}|', $domain;
+    print form {hfill => '-'}, '{>{*}<}', '-';
+    say '';
+    next unless $results->{$domain};
+
+    my $dr = $results->{$domain};
+    print form $fmt, 'Earliest timestamp:', localtime($dr->{'begin'})->strftime('%F %T');
+    print form $fmt, 'Latest timestamp:', localtime($dr->{'end'})->strftime('%F %T');
+    print form $fmt, 'Total messages:', $dr->{'count'};
+    
+    foreach (sort keys $dr->{'disposition'}) {
+        print form $fmt, "DMARC disposition $_:", $dr->{'disposition'}->{$_};
+    }
+    say '';
+
+    say 'Aligned DKIM results:';
+    foreach (sort keys $dr->{'dkim'}) {
+        print form $fmt, "$_:", $dr->{'dkim'}->{$_};
+    }
+    say '';
+
+    if ($dr->{'aligned_dkim_good_domain'}) {
+        say 'Aligned DKIM successes:';
+        foreach (sort keys $dr->{'aligned_dkim_good_domain'}) {
+            print form $fmt, "$_:", $dr->{'aligned_dkim_good_domain'}->{$_};
+        }
+        say '';
+    }
+
+    #if ($dr->{'dkim_good_domain'}) {
+    #    say 'Unaligned DKIM successes:';
+    #    foreach (sort keys $dr->{'dkim_good_domain'}) {
+    #        print form $fmt, "$_:", $dr->{'dkim_good_domain'}->{$_};
+    #    }
+    #    say '';
+    #}
+
+    say 'Aligned SPF results:';
+    foreach (sort keys $dr->{'spf'}) {
+        print form $fmt, "$_:", $dr->{'spf'}->{$_};
+    }
+    say '';
+
+    if ($dr->{'aligned_spf_good_domain'}) {
+        say 'Domain for aligned SPF successes:';
+        foreach (sort keys $dr->{'aligned_spf_good_domain'}) {
+            print form $fmt, "$_:", $dr->{'aligned_spf_good_domain'}->{$_};
+        }
+        say '';
+    }
+
+    say 'Recipient orgs:';
+    foreach (sort { $dr->{'org'}->{$b} <=> $dr->{'org'}->{$a} }
+            keys $dr->{'org'}) {
+        print form $fmt, "$_:", $dr->{'org'}->{$_};
+    }
+    say '';
+
+    if ($origin_limit != -1) {
+        say "Mail sources (>$origin_limit messages):";
+        foreach (sort {
+                $dr->{'sources'}->{$b}->{'count'} <=>
+                $dr->{'sources'}->{$a}->{'count'} } keys $dr->{'sources'}) {
+            last if ($dr->{'sources'}->{$_}->{'count'} <= $origin_limit);
+            my $hostname = `dig +short -x $_`;
+            chomp $hostname;
+            print form $fmt, "IP:", $_;
+            print form $fmt, "Hostname:", $hostname;
+            print form $fmt, "Messages:", $dr->{'sources'}->{$_}{'count'};
+            if ($dr->{'sources'}->{$_}->{'dkim'}) {
+                foreach my $dk (sort keys $dr->{'sources'}->{$_}->{'dkim'}) {
+                    print form $fmt, "DKIM $dk:", $dr->{'sources'}->{$_}->{'dkim'}->{$dk};
+                }
+            }
+            if ($dr->{'sources'}->{$_}->{'spf'}) {
+                foreach my $s (sort keys $dr->{'sources'}->{$_}->{'spf'}) {
+                    print form $fmt, "SPF $s:", $dr->{'sources'}->{$_}->{'spf'}->{$s};
+                }
+            }
+            say '';
+        }
+    }
+}
